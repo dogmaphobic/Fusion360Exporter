@@ -38,6 +38,8 @@ Released versions are tagged with `YYYYMMDD.N` and can be found in the [tags pag
 7) Versions: Control how many versions are exported. See [Versions](#Versions)
 8) Version Separator Is Space: Controls which character `_` or ` ` (space) is used between the name and version (ie. `name_v42.stl` or `name v42.stl`). Defaults to the original `_` and checking this will use ` ` (space) to better match Fusion.
 9) Export Non-Design Files: If true, all [non-design files](https://help.autodesk.com/view/PLM/ENU/?guid=UG-ATTTAB-ATTACHMENTS) will be exported. Note that only the latest version will be exported and the version number will not be appended.
+10) Retry Previously Interrupted Models: A model that was active when Fusion last stopped unexpectedly is skipped by default. Enable this to try quarantined models again.
+11) Minimum Free Memory: Stop before starting another model if available system memory falls below this many GiB or 10% of physical RAM, whichever is greater. The default is 4 GiB.
 
 The last run's settings are loaded by default (if they exist). They are stored next to the `Exporter.py` file on your file system in a file called `last_settings.json`. In "My Scripts", you can right-click "Exporter" and then "Open file location" to get there. If you rename projects or folders you will have to reselect those projects.
 
@@ -63,19 +65,25 @@ By default, only the latest version of each file will be exported. You can chang
 
 # Operation
 
-For each document in each selected project, it will check that there is a file named `<export directory>/<project name>/<document name><version separator><version name>.<file extension>` OR that file name with a few compressed/archived suffixes (see the code). If that file does not exist, it will open the document and do an export of it, then close it. If there are multiple formats to export, it will only open the document once. The exported file has it's `Date Modified` attribute (or `mtime`) set to the modified date (time) of the document (see File Time section for additional info).
+For each document in each selected project, it checks for a non-empty file named `<export directory>/<project name>/<document name><version separator><version name>.<file extension>` or that file name with one of the supported compressed/archived suffixes. An output is skipped only when its modification time is at least as new as the cloud document. Missing, empty, or stale outputs are exported. If there are multiple formats to export, the document is opened only once. The exported file's `Date Modified` attribute (or `mtime`) is set to the cloud document's modified time.
+
+Exports are first written to a hidden partial file in the destination directory. The completed, non-empty partial is atomically moved over the final path, so a failed export does not destroy a known-good local file or masquerade as a completed backup.
 
 For sketches, it will create a folder hiearchy like `<export directory>/<project name>/<component names ...>/<sketch name>.dxf`.
 
 Since document names might have invalid filename characters, we attempt to replace them with spaces. In order to avoid a false collision, if any chars are replaced, the document name will have 8 hexchars of sha256 hash of the original utf-8 encoded document name. Eg `model 1/2 \ * ? <morechars> ||` would be saved as `model 1 2        morechars    _29a6fecc_v1.f3d`
 
-In some ways this is an export and in others, it is more of a sync, since it won't re-export files that already exist and it skips opening documents it doesn't need to (with the caveat being we always have to open every document when exporting sketches).
+In some ways this is an export and in others it is a sync: it does not re-export current files, and it skips opening documents it does not need (with the caveat that exporting sketches requires opening each design).
 
-It will create a log file at `<export_directory>/<timestamp>.txt` that should have some more info if things go wrong.
+It creates a log file at `<export_directory>/<timestamp>.txt`. A progress dialog reports the current model and memory status. Its Stop button requests a clean stop; if Fusion is inside a blocking API call, the request takes effect as soon as that call returns and the current document can be closed.
+
+The exporter also maintains `<export_directory>/.fusion360-export-state.json`. Before opening a file version it records that version durably, and clears the record after the model is closed. If Fusion itself crashes, is killed, or cannot close the document, the next run moves the interrupted version into quarantine and continues past it. On the first run after upgrading from a pre-journal version, a timestamped exporter log whose final line is an `Opening ... vN` entry seeds the same quarantine. The retry option is explicit because retrying a model that crashes Fusion may crash it again.
+
+The completion dialog counts processed model versions separately from output files. `Saved` and `Skipped current` are per output format, so their total can be greater than the number of processed versions. `Errors` is also per failed output and includes quarantined model versions; consult the log for the corresponding model names and Fusion exceptions.
 
 # File Time
 
-Starting in version `20240813.1`, newly exported files have their `Date Modified` (or `mtime`) attribute set to the document's modified time. If you didn't want this you could replace the `set_mtime` function with a noop (ie just `pass`) or open an issue if you think this should be more configurable. However, by default it will not update the `mtime` for files that already exist which have their `mtime` corresponding to when the file was exported, not when the document was modified. If you wanted to do a one-time synchronize for these times, look at the top of source for the variable `update_existing_file_times`. I'm leaving it off by default to avoid pointlessly setting it on every run. And you would need to run the one-time synchronize with all the file formats and projects and versions etc selected that correspond to all the files you want updated.
+Starting in version `20240813.1`, newly exported files have their `Date Modified` (or `mtime`) attribute set to the document's modified time. The exporter now uses that timestamp to decide whether an existing output is current. If you do not want exported timestamps changed, replace `set_mtime` with a no-op, but freshness checking will then reflect the filesystem timestamps instead of the cloud timestamps.
 
 Folders' `mtime` are not handled.
 
@@ -85,6 +93,7 @@ Folders' `mtime` are not handled.
 2) Only visible bodies are included in exports to all file formats except `f3d`. Use the "Unhide All" option to unhide them before exporting
 3) Image renders might cause an error. See [#4](https://github.com/aconz2/Fusion360Exporter/issues/4)
 4) Cloud solves might cause an error. See [#3](https://github.com/aconz2/Fusion360Exporter/issues/3)
+5) Python exceptions returned by Fusion are logged and skipped. A native Fusion crash or a permanently blocked cloud call cannot be caught by a Python script; the durable in-progress journal is what lets the next run identify and skip the responsible model.
 
 # Saved Settings
 
@@ -114,3 +123,8 @@ You might run into an issue with the `VERSION_SEPARATOR` (whether it is export `
 
 Discussion about some changes are in issue [23](https://github.com/aconz2/Fusion360Exporter/issues/23) on folder output structure. I implemented most of those ideas in the `dev` branch some time ago -- including a way to write tests -- but never felt like it was a great change so it is abandoned.
 
+The reliability policy is isolated in `resilience.py` and has no Autodesk imports. Run the test suite outside Fusion with:
+
+```sh
+python3 test.py
+```

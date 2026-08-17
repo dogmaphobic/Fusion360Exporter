@@ -1,5 +1,4 @@
 from pathlib import Path
-import shutil
 import adsk.core
 import traceback
 import json
@@ -10,15 +9,19 @@ data = json.loads(r'''
 {
   "folder": "C:\\...",
   "formats": [
-    "F3D",
-    "STEP"
+    "f3d",
+    "step"
   ],
   "projects_folders": {
     "big long id": ["urn:adsk...."]
   },
+  "use_active_folder": false,
   "unhide_all": true,
   "save_sketches": false,
-  "num_versions": 1
+  "num_versions": 1,
+  "export_non_design_files": false,
+  "retry_quarantined": false,
+  "minimum_free_memory_gib": 4
 }
 ''')
 
@@ -29,5 +32,5 @@ def run(context):
             sys.path.append(d)
         from Exporter import run_main, Ctx
         run_main(Ctx.from_dict(data, adsk.core.Application.get()))
-    except:
+    except Exception:
         adsk.core.Application.get().userInterface.messageBox(traceback.format_exc())
