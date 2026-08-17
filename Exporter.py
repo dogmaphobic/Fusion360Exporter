@@ -12,20 +12,35 @@ from collections import defaultdict
 import itertools
 import json
 import os
+import sys
+import threading
 from functools import partial
 import zipfile
 import base64
 
-# If you have a bunch of files already existing and really want the files' date-modified attr
-# to be correct but don't want to rerun an export, you can change this to True for a single run, then
-# probably change it back so you're not spamming the pointless attr change every time
-update_existing_file_times = False
+# Fusion executes a Script entry point without reliably adding the Script's
+# directory to sys.path.  Make adjacent support modules importable explicitly.
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from resilience import (
+    ExportJournal,
+    MemoryMonitor,
+    bytes_as_gib,
+    output_is_fresh,
+    partial_output_path,
+)
 
 # Older versions of this script used '_' as seperator but Fusion 360 uses ' ' per default in manual exports.
 VERSION_SEPARATOR = '_' # use either ' ' or '_'
 
 log_file = None
 log_fh = None
+active_job = None
+process_event = None
+event_pump = None
+PROCESS_EVENT_ID = 'dogmaphobic_Fusion360Exporter_ProcessNextFile'
 
 handlers = []
 # map from presentation of `project/folder` shown in UI to (project id, folder id)
@@ -41,12 +56,12 @@ def log(*args):
 
 def init_directory(name):
     directory = Path(name)
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(exist_ok=True, parents=True)
     return directory
 
 def init_logging(directory):
     global log_file, log_fh
-    log_file = directory / '{:%Y_%m_%d_%H_%M}.txt'.format(datetime.now())
+    log_file = directory / '{:%Y_%m_%d_%H_%M_%S}.txt'.format(datetime.now())
     log_fh = open(log_file, 'w', encoding="utf-8")
 
 def load_last_settings():
@@ -87,6 +102,8 @@ class Ctx(NamedTuple):
     save_sketches: bool
     num_versions: int # -1 means all versions
     export_non_design_files: bool
+    retry_quarantined: bool = False
+    minimum_free_memory_gib: int = 4
 
     def extend(self, other):
         return self._replace(folder=self.folder / other)
@@ -104,10 +121,15 @@ class Ctx(NamedTuple):
 
     @classmethod
     def from_dict(cls, d, app):
+        d = dict(d)
         d['app'] = app
         d['folder'] = Path(d['folder'])
-        d['formats'] = [FormatFromName[x] for x in d['formats']]
+        d['formats'] = [FormatFromName[x.lower()] for x in d['formats']]
         d['projects_folders'] = {k: set(v) for k, v in d['projects_folders'].items()}
+        d.setdefault('retry_quarantined', False)
+        d.setdefault('minimum_free_memory_gib', 4)
+        d.setdefault('use_active_folder', False)
+        d.setdefault('export_non_design_files', False)
         return cls(**d)
 
     def has_show_folders(self):
@@ -119,13 +141,39 @@ class LazyDocument:
         self._document = None
         self.file = file
         self.unhidden = False
+        self._open_attempted = False
+        self._open_error = None
 
     def open(self):
         if self._document is not None:
             return
+        if self._open_attempted:
+            raise RuntimeError(
+                f'Previous attempt to open `{self.file.name}` v{self.file.versionNumber} failed'
+            ) from self._open_error
+        self._open_attempted = True
         log(f'Opening `{self.file.name}` v{self.file.versionNumber}')
-        self._document = self._ctx.app.documents.open(self.file)
-        self._document.activate()
+        previous_document = self._ctx.app.activeDocument
+        try:
+            self._document = self._ctx.app.documents.open(self.file)
+            if self._document is None:
+                raise RuntimeError('Fusion returned no document')
+            if self._document.activate() is False:
+                raise RuntimeError('Fusion could not activate the opened document')
+        except Exception as exc:
+            self._open_error = exc
+            if self._document is None:
+                try:
+                    candidate = self._ctx.app.activeDocument
+                    if (
+                        candidate is not None
+                        and candidate is not previous_document
+                        and str(candidate.dataFile.versionId) == str(self.file.versionId)
+                    ):
+                        self._document = candidate
+                except Exception:
+                    pass
+            raise
 
     def unhide_all(self):
         if self.unhidden:
@@ -137,7 +185,11 @@ class LazyDocument:
         if self._document is None:
             return
         log(f'Closing `{self.file.name}` v{self.file.versionNumber}')
-        self._document.close(False)  # don't save changes
+        if self._document.close(False) is False:  # don't save changes
+            raise DocumentCloseError(
+                f'Fusion could not close `{self.file.name}` v{self.file.versionNumber}'
+            )
+        self._document = None
 
     @property
     def design(self):
@@ -153,22 +205,37 @@ class LazyDocument:
     def __exit__(self, *args):
         self.close()
 
+
+class ControlledStop(Exception):
+    """Base class for a deliberate, clean stop of the export job."""
+
+
+class UserCancelled(ControlledStop):
+    pass
+
+
+class DocumentCloseError(ControlledStop):
+    pass
+
 @dataclass
 class Counter:
     saved: int = 0
     skipped: int = 0
     errored: int = 0
+    quarantined: int = 0
 
     def __add__(self, other):
         return Counter(
             self.saved + other.saved,
             self.skipped + other.skipped,
             self.errored + other.errored,
+            self.quarantined + other.quarantined,
         )
     def __iadd__(self, other):
         self.saved += other.saved
         self.skipped += other.skipped
         self.errored += other.errored
+        self.quarantined += other.quarantined
         return self
 
 def design_from_document(document: adsk.core.Document):
@@ -214,25 +281,49 @@ def set_mtime(path: Path, time: int):
 
 def output_path_exists(path: Path, file: adsk.core.DataFile) -> bool:
     """
-    Check if the file path already exists with version extension.
-    Also checks for archived versions of the files to export and if update_existing_file_times
-    is set, updates the mtime of existing files (not the archives).
+    Check whether a non-empty output (or archived output) is at least as new as
+    the cloud data file. Stale outputs are deliberately re-exported.
     """
-    if path.exists():
-        if update_existing_file_times:
-            set_mtime(path, file.dateModified)
-            log(f'{path} already exists, but mtime was corrected')
-        else:
-            log(f'{path} already exists, skipping')
+    if output_is_fresh(path, file.dateModified):
+        log(f'{path} is up to date, skipping')
         return True
+    if path.exists():
+        log(f'{path} exists but is stale or empty, replacing')
 
     for archive_extension in archive_extensions:
         archive_path = path.with_name(path.name + archive_extension)
-        if archive_path.exists():
-            log(f'{path} already exists as archive, skipping')
+        if output_is_fresh(archive_path, file.dateModified):
+            log(f'{path} has an up-to-date archive at {archive_path}, skipping')
             return True
+        if archive_path.exists():
+            log(f'{archive_path} exists but is stale or empty')
 
     return False
+
+
+def atomic_output(output_path: Path, source_mtime: int, write_partial, postprocess=None):
+    """Write beside the target and publish it only after successful validation."""
+    output_path.parent.mkdir(exist_ok=True, parents=True)
+    partial_path = partial_output_path(output_path)
+    try:
+        if partial_path.exists():
+            partial_path.unlink()
+        result = write_partial(partial_path)
+        if result is False:
+            raise RuntimeError(f'Fusion reported that writing {output_path} failed')
+        if not partial_path.exists() or partial_path.stat().st_size == 0:
+            raise RuntimeError(f'Fusion did not create a non-empty {output_path.suffix} file')
+        if postprocess is not None:
+            postprocess(partial_path)
+        os.replace(partial_path, output_path)
+        set_mtime(output_path, source_mtime)
+    except Exception:
+        try:
+            if partial_path.exists():
+                partial_path.unlink()
+        except OSError:
+            pass
+        raise
 
 # component: adsk.core.Component but that doesn't exist for some reason?
 # sketch   : adsk.core.Sketch likewise
@@ -242,22 +333,33 @@ def export_sketch(ctx: Ctx, doc: LazyDocument, component, sketch):
         return Counter(skipped=1)
 
     log(f'Exporting sketch {sketch.name} in {component.name} to {output_path}')
-    output_path.parent.mkdir(exist_ok=True, parents=True)
-    sketch.saveAsDXF(str(output_path))
-    set_mtime(output_path, doc.file.dateModified)
+    atomic_output(
+        output_path,
+        doc.file.dateModified,
+        lambda partial_path: sketch.saveAsDXF(str(partial_path)),
+    )
     return Counter(saved=1)
 
-def visit_sketches(ctx: Ctx, doc: LazyDocument, component):
+def visit_sketches(ctx: Ctx, doc: LazyDocument, component, control=None):
     counter = Counter()
     for sketch in component.sketches:
         try:
+            check_control(control)
             counter += export_sketch(ctx, doc, component, sketch)
+        except ControlledStop:
+            raise
         except Exception:
             log(traceback.format_exc())
             counter.errored += 1
 
     for occurrence in component.occurrences:
-        counter += visit_sketches(ctx.extend(sanitize_filename(occurrence.name)), doc, occurrence.component)
+        check_control(control)
+        counter += visit_sketches(
+            ctx.extend(sanitize_filename(occurrence.name)),
+            doc,
+            occurrence.component,
+            control,
+        )
 
     return counter
 
@@ -279,9 +381,9 @@ def export_filename(ctx: Ctx, file: adsk.core.DataFile, format: Format=None):
     name = f'{sanitized}{VERSION_SEPARATOR}v{file.versionNumber}.{extension}'
     return ctx.folder / name
 
-def export_file(ctx: Ctx, format: Format, doc: LazyDocument) -> Counter:
+def export_file(ctx: Ctx, format: Format, doc: LazyDocument, check_existing=True) -> Counter:
     output_path = export_filename(ctx, doc.file, format)
-    if output_path_exists(output_path, doc.file):
+    if check_existing and output_path_exists(output_path, doc.file):
         return Counter(skipped=1)
 
     doc.open()
@@ -289,48 +391,52 @@ def export_file(ctx: Ctx, format: Format, doc: LazyDocument) -> Counter:
     design = doc.design
     em = design.exportManager
 
-    output_path.parent.mkdir(exist_ok=True, parents=True)
-    output_path_s = str(output_path)
-
-    if format == Format.F3D:
-        options = em.createFusionArchiveExportOptions(output_path_s)
-    elif format == Format.STL:
-        options = em.createSTLExportOptions(design.rootComponent, output_path_s)
-    elif format == Format.TMF:
-        options = em.createC3MFExportOptions(design.rootComponent, output_path_s)
-    elif format == Format.STEP:
-        options = em.createSTEPExportOptions(output_path_s)
-    elif format == Format.IGES:
-        options = em.createIGESExportOptions(output_path_s)
-    elif format == Format.SAT:
-        options = em.createSATExportOptions(output_path_s)
-    elif format == Format.SMT:
-        options = em.createSMTExportOptions(output_path_s)
-
-    else:
-        raise Exception(f'Got unknown export format {format}')
-
     # f3d already saves everything that is hidden and for the thumbnail to look nice, we don't want to unhide everything
     # Note that because unhiding is a mutation, the order of calls to export_file matters, but f3d will be first
     if ctx.unhide_all and format != Format.F3D:
         doc.unhide_all()
 
-    em.execute(options)
-    set_mtime(output_path, doc.file.dateModified)
-    log(f'Saved {output_path}')
+    def write_partial(partial_path):
+        partial_path_s = str(partial_path)
+        if format == Format.F3D:
+            options = em.createFusionArchiveExportOptions(partial_path_s)
+        elif format == Format.STL:
+            options = em.createSTLExportOptions(design.rootComponent, partial_path_s)
+        elif format == Format.TMF:
+            options = em.createC3MFExportOptions(design.rootComponent, partial_path_s)
+        elif format == Format.STEP:
+            options = em.createSTEPExportOptions(partial_path_s)
+        elif format == Format.IGES:
+            options = em.createIGESExportOptions(partial_path_s)
+        elif format == Format.SAT:
+            options = em.createSATExportOptions(partial_path_s)
+        elif format == Format.SMT:
+            options = em.createSMTExportOptions(partial_path_s)
+        else:
+            raise ValueError(f'Got unknown export format {format}')
+        if options is None:
+            raise RuntimeError(f'Fusion could not create export options for {format.value}')
+        return em.execute(options)
 
-    # add a preview thumbnail
-    if format == Format.F3D:
-        thumb_b64 = design.rootComponent.createThumbnail(256, 256, 'PNG').getAsBase64String()
-        with zipfile.ZipFile(output_path, 'a') as zf:
-            with zf.open('FusionAssetName[Active]/Previews/small.png', 'w') as fh:
-                fh.write(base64.b64decode(thumb_b64))
+    def add_thumbnail(partial_path):
+        if format != Format.F3D:
+            return
+        try:
+            thumb_b64 = design.rootComponent.createThumbnail(256, 256, 'PNG').getAsBase64String()
+            with zipfile.ZipFile(partial_path, 'a') as zf:
+                with zf.open('FusionAssetName[Active]/Previews/small.png', 'w') as fh:
+                    fh.write(base64.b64decode(thumb_b64))
+        except Exception:
+            log(f'WARNING: could not add thumbnail to {output_path}\n{traceback.format_exc()}')
+
+    atomic_output(output_path, doc.file.dateModified, write_partial, add_thumbnail)
+    log(f'Saved {output_path}')
 
     return Counter(saved=1)
 
-def export_drawing(ctx: Ctx, format: Format, doc: LazyDocument) -> Counter:
+def export_drawing(ctx: Ctx, format: Format, doc: LazyDocument, check_existing=True) -> Counter:
     output_path = export_filename(ctx, doc.file, format)
-    if output_path_exists(output_path, doc.file):
+    if check_existing and output_path_exists(output_path, doc.file):
         return Counter(skipped=1)
 
     doc.open()
@@ -338,20 +444,25 @@ def export_drawing(ctx: Ctx, format: Format, doc: LazyDocument) -> Counter:
     drawing = adsk.drawing.Drawing.cast(ctx.app.activeProduct)
     em: adsk.drawing.DrawingExportManager = drawing.exportManager
 
-    output_path.parent.mkdir(exist_ok=True, parents=True)
-    output_path_s = str(output_path)
+    def write_partial(partial_path):
+        options = em.createPDFExportOptions(str(partial_path))
+        if options is None:
+            raise RuntimeError('Fusion could not create PDF export options')
+        return em.execute(options)
 
-    options = em.createPDFExportOptions(output_path_s)
-
-    em.execute(options)
+    atomic_output(output_path, doc.file.dateModified, write_partial)
     log(f'PDF created {output_path}')
-    set_mtime(output_path, doc.file.dateModified)
     log(f'Saved {output_path}')
 
     return Counter(saved=1)
 
 
-def visit_file(ctx: Ctx, file: adsk.core.DataFile) -> Counter:
+def check_control(control):
+    if control is not None:
+        control.check()
+
+
+def visit_file(ctx: Ctx, file: adsk.core.DataFile, control=None) -> Counter:
     log(f'Visiting file {file.name} v{file.versionNumber}.{file.fileExtension}')
 
     counter = Counter()
@@ -370,11 +481,11 @@ def visit_file(ctx: Ctx, file: adsk.core.DataFile) -> Counter:
                 counter.skipped += 1
                 return counter
 
-            output_path.parent.mkdir(exist_ok=True, parents=True)
-
-            file.download(str(output_path), None)  # Synchronous download
-
-            set_mtime(output_path, file.dateModified)
+            atomic_output(
+                output_path,
+                file.dateModified,
+                lambda partial_path: file.download(str(partial_path), None),
+            )
             log(f'Saved {output_path}')
             counter.saved += 1
 
@@ -385,24 +496,65 @@ def visit_file(ctx: Ctx, file: adsk.core.DataFile) -> Counter:
         return counter
 
     with LazyDocument(ctx, file) as doc:
+        drawing_needed = False
+        if file.fileExtension == 'f2d' and Format.PDF in ctx.formats:
+            if output_path_exists(export_filename(ctx, file, Format.PDF), file):
+                counter.skipped += 1
+            else:
+                drawing_needed = True
+        formats_needed = []
+        if file.fileExtension == 'f3d':
+            for format in ctx.formats:
+                if format == Format.PDF:
+                    continue
+                if output_path_exists(export_filename(ctx, file, format), file):
+                    counter.skipped += 1
+                else:
+                    formats_needed.append(format)
+
+        needs_open = (
+            (ctx.save_sketches and file.fileExtension != 'f2d')
+            or drawing_needed
+            or bool(formats_needed)
+        )
+        if needs_open:
+            check_control(control)
+            try:
+                doc.open()
+            except Exception:
+                counter.errored += 1
+                log(
+                    f'ERROR opening `{file.name}` v{file.versionNumber}; skipping this model\n'
+                    f'{traceback.format_exc()}'
+                )
+                return counter
 
         if ctx.save_sketches and file.fileExtension != 'f2d':
-            doc.open()
-            counter += visit_sketches(ctx.extend(sanitize_filename(doc.rootComponent.name)), doc, doc.rootComponent)
+            check_control(control)
+            counter += visit_sketches(
+                ctx.extend(sanitize_filename(doc.rootComponent.name)),
+                doc,
+                doc.rootComponent,
+                control,
+            )
 
-        if file.fileExtension == 'f2d' and Format.PDF in ctx.formats:
+        if drawing_needed:
             try:
-                counter += export_drawing(ctx, Format.PDF, doc)
+                check_control(control)
+                counter += export_drawing(ctx, Format.PDF, doc, check_existing=False)
+            except ControlledStop:
+                raise
             except Exception:
                 counter.errored += 1
                 log(traceback.format_exc())
 
         elif file.fileExtension == 'f3d':
-            for format in ctx.formats:
-                if format == Format.PDF:
-                    continue
+            for format in formats_needed:
                 try:
-                    counter += export_file(ctx, format, doc)
+                    check_control(control)
+                    counter += export_file(ctx, format, doc, check_existing=False)
+                except ControlledStop:
+                    raise
                 except Exception:
                     counter.errored += 1
                     log(traceback.format_exc())
@@ -436,7 +588,7 @@ def file_versions(file: adsk.core.DataFile, num_versions):
         yield v
         prev = v.versionNumber
 
-def visit_folder(ctx: Ctx, folder, recurse=True) -> Counter:
+def visit_folder(ctx: Ctx, folder, recurse=True, control=None) -> Counter:
     log(f'Visiting folder {folder.name}')
 
     new_ctx = ctx.extend(sanitize_filename(folder.name))
@@ -446,14 +598,18 @@ def visit_folder(ctx: Ctx, folder, recurse=True) -> Counter:
     for file in folder.dataFiles:
         try:
             for file_version in file_versions(file, ctx.num_versions):
-                counter += visit_file(new_ctx, file_version)
+                check_control(control)
+                counter += visit_file(new_ctx, file_version, control)
+        except ControlledStop:
+            raise
         except Exception:
             log(f'Got exception visiting file\n{traceback.format_exc()}')
             counter.errored += 1
 
     if recurse:
         for sub_folder in folder.dataFolders:
-            counter += visit_folder(new_ctx, sub_folder)
+            check_control(control)
+            counter += visit_folder(new_ctx, sub_folder, control=control)
 
     return counter
 
@@ -474,11 +630,11 @@ def main(ctx: Ctx) -> Counter:
         for project_id, folder_ids in ctx.projects_folders.items():
             project = ctx.app.data.dataProjects.itemById(project_id)
 
-            if folder_ids == []:  # empty filter visit everything
+            if not folder_ids:  # empty filter visits everything
                 counter += visit_folder(ctx, project.rootFolder)
 
             # if the root folder is the only thing selected, we take that to mean no recurse
-            elif folder_ids == [project.rootFolder.id]:
+            elif set(folder_ids) == {project.rootFolder.id}:
                 counter += visit_folder(ctx, project.rootFolder, recurse=False)
 
             else:
@@ -491,8 +647,423 @@ def main(ctx: Ctx) -> Counter:
 
     return counter
 
+
+@dataclass(frozen=True)
+class FileWorkItem:
+    ctx: Ctx
+    file: object
+
+    @property
+    def key(self):
+        try:
+            return str(self.file.versionId)
+        except Exception:
+            return f'{self.file.id}:v{self.file.versionNumber}'
+
+    def journal_record(self):
+        return {
+            'key': self.key,
+            'name': str(self.file.name),
+            'version': int(self.file.versionNumber),
+            'extension': str(self.file.fileExtension),
+            'output_folder': str(self.ctx.folder),
+        }
+
+
+def collect_folder_work(ctx: Ctx, folder, recurse, items, counter):
+    log(f'Collecting folder {folder.name}')
+    new_ctx = ctx.extend(sanitize_filename(folder.name))
+    try:
+        files = [file for file in folder.dataFiles]
+    except Exception:
+        log(f'ERROR collecting files beneath {folder.name}\n{traceback.format_exc()}')
+        counter.errored += 1
+        files = []
+
+    for file in files:
+        try:
+            for file_version in file_versions(file, ctx.num_versions):
+                items.append(FileWorkItem(new_ctx, file_version))
+        except Exception:
+            log(f'ERROR collecting versions for {getattr(file, "name", "?")}\n{traceback.format_exc()}')
+            counter.errored += 1
+
+    if not recurse:
+        return
+    try:
+        subfolders = [subfolder for subfolder in folder.dataFolders]
+    except Exception:
+        log(f'ERROR collecting subfolders beneath {folder.name}\n{traceback.format_exc()}')
+        counter.errored += 1
+        return
+    for subfolder in subfolders:
+        try:
+            collect_folder_work(new_ctx, subfolder, True, items, counter)
+        except Exception:
+            log(f'ERROR collecting folder {getattr(subfolder, "name", "?")}\n{traceback.format_exc()}')
+            counter.errored += 1
+
+
+def collect_work_items(ctx: Ctx):
+    items = []
+    counter = Counter()
+    if ctx.use_active_folder:
+        root_folder = ctx.app.data.activeFolder
+        tree_buffer = tree_gen(root_folder)
+        collect_folder_work(ctx.extend(Path(tree_buffer)), root_folder, True, items, counter)
+    else:
+        for project_id, folder_ids in ctx.projects_folders.items():
+            try:
+                project = ctx.app.data.dataProjects.itemById(project_id)
+                if project is None:
+                    raise RuntimeError(f'Project {project_id} no longer exists')
+                if not folder_ids:
+                    collect_folder_work(ctx, project.rootFolder, True, items, counter)
+                elif set(folder_ids) == {project.rootFolder.id}:
+                    collect_folder_work(ctx, project.rootFolder, False, items, counter)
+                else:
+                    wanted = set(folder_ids)
+                    for folder in project.rootFolder.dataFolders:
+                        if folder.id in wanted:
+                            collect_folder_work(ctx, folder, True, items, counter)
+            except Exception:
+                log(f'ERROR collecting project {project_id}\n{traceback.format_exc()}')
+                counter.errored += 1
+    return items, counter
+
+
+class ExportJobControl:
+    def __init__(self, job):
+        self.job = job
+
+    def check(self):
+        if self.job.stop_requested or self.job.was_cancelled():
+            raise UserCancelled('Export stopped at user request')
+
+
+class ExportJob:
+    def __init__(self, ctx: Ctx):
+        init_directory(ctx.folder)
+        # Construct recovery state before opening this run's new log so a
+        # pre-journal crash can be recognized from the previous log.
+        self.journal = ExportJournal(ctx.folder)
+        init_logging(ctx.folder)
+        log(ctx.dumps())
+        self.ctx = ctx
+        self.ui = ctx.app.userInterface
+        self.counter = Counter()
+        self.items = []
+        self.index = 0
+        self.prepared = False
+        self.finished = False
+        self.step_active = False
+        self.stop_reason = None
+        self.stop_requested = False
+        self.progress = None
+        self.control = ExportJobControl(self)
+        self.memory_monitor = MemoryMonitor(ctx.minimum_free_memory_gib, 0.10)
+        self.last_memory = None
+        if self.journal.load_error:
+            log(f'WARNING: {self.journal.load_error}')
+        if self.journal.recovered_record:
+            record = self.journal.recovered_record
+            log(
+                f'QUARANTINED after interrupted run: {record.get("name", "?")} '
+                f'v{record.get("version", "?")} ({record.get("key", "?")})'
+            )
+
+    def prepare(self):
+        self.progress = self.ui.createProgressDialog()
+        self.progress.cancelButtonText = 'Stop after current model'
+        self.progress.isCancelButtonShown = True
+        self.progress.isBackgroundTranslucent = False
+        self.progress.show('Fusion 360 Exporter', 'Collecting cloud files...', 0, 1, 0)
+        self.items, collection_counter = collect_work_items(self.ctx)
+        self.counter += collection_counter
+        self.progress.maximumValue = max(1, len(self.items))
+        self.prepared = True
+        log(f'Collected {len(self.items)} file version(s)')
+
+    def step(self):
+        if not self.prepared:
+            self.prepare()
+            if not self.items:
+                self.stop_reason = 'completed'
+                return False
+            return True
+        if self.stop_requested or self.was_cancelled():
+            self.stop_reason = 'cancelled'
+            return False
+        snapshot = self.sample_memory()
+        if snapshot is None:
+            self.stop_reason = 'memory monitor'
+            return False
+        if self.memory_monitor.is_low(snapshot):
+            self.stop_reason = 'memory'
+            floor = self.memory_monitor.safety_floor(snapshot)
+            log(f'STOPPING for memory pressure: {snapshot.describe()}; floor {bytes_as_gib(floor)}')
+            return False
+        if self.index >= len(self.items):
+            self.stop_reason = 'completed'
+            return False
+
+        item = self.items[self.index]
+        self.progress.message = (
+            f'File %v of %m\n{item.file.name} v{item.file.versionNumber}\n{snapshot.describe()}'
+        )
+        self.process_item(item)
+        self.index += 1
+        self.progress.progressValue = self.index
+
+        if self.stop_reason in ('cancelled', 'close failure', 'journal failure'):
+            return False
+        snapshot = self.sample_memory()
+        if snapshot is None:
+            self.stop_reason = 'memory monitor'
+            return False
+        if self.memory_monitor.is_low(snapshot):
+            self.stop_reason = 'memory'
+            floor = self.memory_monitor.safety_floor(snapshot)
+            log(f'STOPPING after file for memory pressure: {snapshot.describe()}; floor {bytes_as_gib(floor)}')
+            return False
+        if self.stop_requested or self.was_cancelled():
+            self.stop_reason = 'cancelled'
+            return False
+        if self.index >= len(self.items):
+            self.stop_reason = 'completed'
+            return False
+        return True
+
+    def process_item(self, item):
+        record = item.journal_record()
+        if self.journal.is_quarantined(item.key, record):
+            if self.ctx.retry_quarantined:
+                log(f'Retrying quarantined file {item.file.name} v{item.file.versionNumber}')
+                self.journal.retry(item.key, record)
+            else:
+                log(f'Skipping quarantined file {item.file.name} v{item.file.versionNumber}')
+                self.counter.quarantined += 1
+                self.counter.errored += 1
+                return
+
+        self.journal.begin(record)
+        safe_to_clear_journal = True
+        try:
+            self.counter += visit_file(item.ctx, item.file, self.control)
+        except UserCancelled:
+            self.stop_reason = 'cancelled'
+        except DocumentCloseError:
+            safe_to_clear_journal = False
+            self.counter.errored += 1
+            self.stop_reason = 'close failure'
+            log(f'ERROR closing file; stopping safely\n{traceback.format_exc()}')
+        except Exception:
+            self.counter.errored += 1
+            log(f'ERROR processing file\n{traceback.format_exc()}')
+        finally:
+            if safe_to_clear_journal:
+                try:
+                    self.journal.finish()
+                except Exception:
+                    self.counter.errored += 1
+                    self.stop_reason = 'journal failure'
+                    log(f'ERROR clearing recovery journal\n{traceback.format_exc()}')
+
+    def sample_memory(self):
+        try:
+            self.last_memory = self.memory_monitor.sample()
+            return self.last_memory
+        except Exception:
+            self.counter.errored += 1
+            log(f'ERROR monitoring memory\n{traceback.format_exc()}')
+            return None
+
+    def was_cancelled(self):
+        try:
+            return self.progress is not None and bool(self.progress.wasCancelled)
+        except Exception:
+            return False
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def finish(self, reason=None):
+        global log_fh
+        if self.finished:
+            return
+        self.finished = True
+        if reason:
+            self.stop_reason = reason
+        if not self.stop_reason:
+            self.stop_reason = 'completed'
+        if self.progress is not None:
+            try:
+                self.progress.hide()
+            except Exception:
+                log(f'ERROR hiding progress dialog\n{traceback.format_exc()}')
+
+        status = {
+            'completed': 'Export completed',
+            'cancelled': 'Export stopped at your request',
+            'memory': 'Export stopped before memory pressure became unsafe',
+            'memory monitor': 'Export stopped because memory could not be monitored safely',
+            'close failure': 'Export stopped because Fusion could not close a document',
+            'journal failure': 'Export stopped because recovery state could not be saved safely',
+            'fatal error': 'Export stopped after an unrecoverable runner error',
+        }.get(self.stop_reason, f'Export stopped: {self.stop_reason}')
+        lines = [
+            status,
+            f'Processed {self.index} of {len(self.items)} file versions',
+            f'Saved {self.counter.saved} files',
+            f'Skipped {self.counter.skipped} current files',
+            f'Skipped {self.counter.quarantined} quarantined models',
+            f'Encountered {self.counter.errored} errors',
+        ]
+        if self.last_memory is not None:
+            lines.append(f'Final memory: {self.last_memory.describe()}')
+        if self.stop_reason == 'memory':
+            lines.append('Restart Fusion before resuming the export.')
+        elif self.stop_reason == 'close failure':
+            lines.append('Close the remaining document or restart Fusion before resuming.')
+        lines.append(f'Log file is at {log_file}')
+        summary = '\n'.join(lines)
+        log(summary)
+        if log_fh is not None:
+            log_fh.close()
+            log_fh = None
+        self.ui.messageBox(summary)
+
 def message_box_traceback():
     adsk.core.Application.get().userInterface.messageBox(traceback.format_exc())
+
+
+class CustomEventPump(threading.Thread):
+    """Queue custom events from the worker thread expected by Fusion's API."""
+
+    def __init__(self, app, dispatch_delay=0.01):
+        super().__init__(name='Fusion360ExporterEventPump', daemon=True)
+        self.app = app
+        self.dispatch_delay = dispatch_delay
+        self.requested = threading.Event()
+        self.stopping = threading.Event()
+
+    def request(self):
+        self.requested.set()
+
+    def shutdown(self):
+        self.stopping.set()
+        self.requested.set()
+
+    def run(self):
+        while not self.stopping.is_set():
+            self.requested.wait()
+            self.requested.clear()
+            if self.stopping.is_set():
+                return
+            # Let the Fusion event handler which requested this dispatch return
+            # before asking Fusion for another callback.
+            if self.stopping.wait(self.dispatch_delay):
+                return
+            try:
+                # Fire exactly once. Fusion has been observed to enqueue the
+                # callback even when this method reports False. Retrying can
+                # therefore flood the queue and re-enter a blocking document
+                # open hundreds of times.
+                self.app.fireCustomEvent(PROCESS_EVENT_ID, '{}')
+            except Exception:
+                # A Python exception means no reliable main-thread reporting
+                # path remains. The next explicit request gets another chance.
+                pass
+
+
+def shutdown_event_pump():
+    global event_pump
+    pump = event_pump
+    event_pump = None
+    if pump is not None:
+        pump.shutdown()
+
+
+def terminate_exporter():
+    shutdown_event_pump()
+    adsk.terminate()
+
+
+class ExporterProcessEventHandler(adsk.core.CustomEventHandler):
+    def notify(self, args):
+        global active_job
+        if active_job is None:
+            return
+        job = active_job
+        if job.step_active:
+            log('WARNING: ignored a re-entrant export event')
+            return
+        job.step_active = True
+        queue_next = False
+        should_terminate = False
+        try:
+            ui = job.ui
+            if ui.activeCommand != 'SelectCommand':
+                select_command = ui.commandDefinitions.itemById('SelectCommand')
+                if select_command is not None:
+                    select_command.execute()
+            if job.step():
+                if event_pump is None:
+                    raise RuntimeError('The export event pump is not running')
+                queue_next = True
+            else:
+                active_job = None
+                job.finish()
+                should_terminate = True
+        except Exception:
+            active_job = None
+            try:
+                job.counter.errored += 1
+                log(f'FATAL export runner error\n{traceback.format_exc()}')
+                job.finish('fatal error')
+            except Exception:
+                try:
+                    job.ui.messageBox(f'Exporter failed while reporting an error:\n{traceback.format_exc()}')
+                except Exception:
+                    pass
+            should_terminate = True
+        finally:
+            job.step_active = False
+
+        if queue_next:
+            event_pump.request()
+        elif should_terminate:
+            terminate_exporter()
+
+
+def register_process_event(app):
+    global process_event, event_pump
+    shutdown_event_pump()
+    try:
+        app.unregisterCustomEvent(PROCESS_EVENT_ID)
+    except Exception:
+        pass
+    process_event = app.registerCustomEvent(PROCESS_EVENT_ID)
+    if process_event is None:
+        raise RuntimeError('Could not register the exporter processing event')
+    handler = ExporterProcessEventHandler()
+    if process_event.add(handler) is False:
+        raise RuntimeError('Could not attach the exporter processing handler')
+    handlers.append(handler)
+    event_pump = CustomEventPump(app)
+    event_pump.start()
+
+
+def start_export_job(ctx):
+    global active_job
+    if active_job is not None:
+        ctx.app.userInterface.messageBox('An export job is already running.')
+        return False
+    if event_pump is None:
+        raise RuntimeError('The export event pump is not running')
+    active_job = ExportJob(ctx)
+    event_pump.request()
+    return True
 
 class I(StrEnum):
     """UI input ids"""
@@ -507,6 +1078,8 @@ class I(StrEnum):
     save_sketches = 'save_sketches'
     version_separator_is_space = 'version_separator_is_space'
     export_non_design_files = 'export_non_design_files'
+    retry_quarantined = 'retry_quarantined'
+    minimum_free_memory_gib = 'minimum_free_memory_gib'
 
 def populate_data_projects_list(dropdown, show_folders=False, selected=None):
     app = adsk.core.Application.get()
@@ -601,13 +1174,33 @@ class ExporterCommandCreatedEventHandler(adsk.core.CommandCreatedEventHandler):
 
             export_non_design_files = last_settings.get(I.export_non_design_files, False)
             inputs.addBoolValueInput(I.export_non_design_files, 'Export Non-Design Files', True, '', export_non_design_files)
+
+            retry_quarantined = last_settings.get(I.retry_quarantined, False)
+            inputs.addBoolValueInput(
+                I.retry_quarantined,
+                'Retry Previously Interrupted Models',
+                True,
+                '',
+                retry_quarantined,
+            )
+
+            minimum_free_memory_gib = last_settings.get(I.minimum_free_memory_gib, 4)
+            inputs.addIntegerSpinnerCommandInput(
+                I.minimum_free_memory_gib,
+                'Minimum Free Memory (GiB)',
+                1,
+                128,
+                1,
+                minimum_free_memory_gib,
+            )
         except:
             message_box_traceback()
 
 class ExporterCommandDestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
-            adsk.terminate()
+            if active_job is None:
+                terminate_exporter()
         except:
             message_box_traceback()
 
@@ -627,27 +1220,10 @@ def make_projects_folders(inputs):
     return ret
 
 def run_main(ctx):
-    try:
-        app = adsk.core.Application.get()
-        ui = app.userInterface
-        counter = main(ctx)
-        summary = '\n'.join((
-            f'Saved {counter.saved} files',
-            f'Skipped {counter.skipped} files',
-            f'Encountered {counter.errored} errors',
-            f'Log file is at {log_file}'
-        ))
-        log(summary)
-        ui.messageBox(summary)
-
-    except:
-        tb = traceback.format_exc()
-        adsk.core.Application.get().userInterface.messageBox(f'Log file is at {log_file}\n{tb}')
-        if log_fh is not None:
-            log(f'Got top level exception\n{tb}')
-    finally:
-        if log_fh is not None:
-            log_fh.close()
+    """Start an export from a saved-settings script using the resilient runner."""
+    register_process_event(ctx.app)
+    adsk.autoTerminate(False)
+    return start_export_job(ctx)
 
 def input_value(inputs, name):
     return inputs.itemById(name).value
@@ -674,6 +1250,8 @@ class ExporterCommandExecuteHandler(adsk.core.CommandEventHandler):
                 I.all_versions: iv(I.all_versions),
                 I.version_separator_is_space: iv(I.version_separator_is_space),
                 I.export_non_design_files: iv(I.export_non_design_files),
+                I.retry_quarantined: iv(I.retry_quarantined),
+                I.minimum_free_memory_gib: iv(I.minimum_free_memory_gib),
             })
 
             # kinda hacky
@@ -691,8 +1269,10 @@ class ExporterCommandExecuteHandler(adsk.core.CommandEventHandler):
                 save_sketches = iv(I.save_sketches),
                 num_versions = -1 if iv(I.all_versions) else iv(I.version_count),
                 export_non_design_files = iv(I.export_non_design_files),
+                retry_quarantined = iv(I.retry_quarantined),
+                minimum_free_memory_gib = iv(I.minimum_free_memory_gib),
             )
-            run_main(ctx)
+            start_export_job(ctx)
         except:
             message_box_traceback()
 
@@ -702,6 +1282,8 @@ def run(context):
         app = adsk.core.Application.get()
         ui = app.userInterface
         cmd_defs = ui.commandDefinitions
+
+        register_process_event(app)
 
         CMD_DEF_ID = 'aconz2_Exporter'
         cmd_def = cmd_defs.itemById(CMD_DEF_ID)
@@ -726,3 +1308,10 @@ def run(context):
     except:
         if ui:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
+
+
+def stop(context):
+    if active_job is not None:
+        active_job.request_stop()
+    else:
+        shutdown_event_pump()
